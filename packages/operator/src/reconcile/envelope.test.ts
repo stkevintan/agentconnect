@@ -6,7 +6,7 @@ import { AgentConnectOrgApi } from '../crd/api.js'
 import { NAMESPACE_CLAIM_LABEL, type AgentConnectOrgSpec } from '../crd/types.js'
 import { AgentConnectOrgSpecSchema } from '../crd/types.js'
 import { newObservations, type ReconcileContext } from './context.js'
-import { reconcileEnvelope, type EnvelopeInputs } from './envelope.js'
+import { envelopeInputs, reconcileEnvelope, type EnvelopeInputs } from './envelope.js'
 import { SANDBOX_EXTENSIONS_GROUP, groupPath, namespacePath } from './resources.js'
 
 afterEach(closeFakeApiServers)
@@ -56,15 +56,18 @@ const NS = 'test-ac-org-acme'
 
 function specOf(overrides: Partial<AgentConnectOrgSpec> = {}): AgentConnectOrgSpec {
   return AgentConnectOrgSpecSchema.parse({
-    targetNamespace: NS,
     daemon: { image: 'ghcr.io/example/daemon:v1', tier: 'small' },
     runtime: { image: 'ghcr.io/example/runtime:v1', tiers: [{ name: 'std', warmReplicas: 2 }] },
     ...overrides
   })
 }
 
-function inputOf(overrides: Partial<AgentConnectOrgSpec> = {}): EnvelopeInputs {
-  return { orgName: 'acme', spec: specOf(overrides) }
+function inputOf(
+  ctx: ReconcileContext,
+  overrides: Partial<AgentConnectOrgSpec> = {},
+  orgName = 'acme'
+): EnvelopeInputs {
+  return envelopeInputs(ctx, orgName, specOf(overrides))
 }
 
 const MASTER_TEMPLATE = {
@@ -93,12 +96,13 @@ const byPath = (writes: RecordedWrite[], suffix: string): RecordedWrite | undefi
   writes.find((write) => write.path.endsWith(suffix))
 
 describe('reconcileEnvelope', () => {
+  // No targetNamespace anywhere below unless a test sets one: NS is what the CR name derives.
   it('stamps the full inventory into a fresh namespace', async () => {
     const { gets, writes, route } = recorder()
     const ctx = await contextFor(route)
     gets.set(masterPath(ctx.controlNamespace), MASTER_TEMPLATE)
     const obs = newObservations()
-    await reconcileEnvelope(ctx, inputOf(), obs)
+    await reconcileEnvelope(ctx, inputOf(ctx), obs)
 
     expect(obs.namespaceReady).toBe(true)
     expect(obs.namespace).toBe(NS)
@@ -165,12 +169,46 @@ describe('reconcileEnvelope', () => {
     expect(byPath(writes, '/services/ac-daemon-shim')).toBeDefined()
   })
 
-  it('refuses a namespace outside the install prefix without writing anything', async () => {
+  it('honours a targetNamespace override that stays inside the install prefix', async () => {
+    const override = 'test-ac-org-legacy'
+    const { gets, writes, route } = recorder()
+    const ctx = await contextFor(route)
+    gets.set(masterPath(ctx.controlNamespace), MASTER_TEMPLATE)
+    const obs = newObservations()
+    await reconcileEnvelope(ctx, inputOf(ctx, { targetNamespace: override }), obs)
+
+    expect(obs.namespace).toBe(override)
+    expect(byPath(writes, `/namespaces/${override}`)).toBeDefined()
+    expect(byPath(writes, `/clusterrolebindings/ac-tokenreview-${override}`)).toBeDefined()
+    expect(writes.some((write) => write.path.includes(`/namespaces/${NS}/`))).toBe(false)
+  })
+
+  it('refuses an override outside the install prefix without writing anything', async () => {
     const { writes, route } = recorder()
     const ctx = await contextFor(route)
     const obs = newObservations()
-    await reconcileEnvelope(ctx, inputOf({ targetNamespace: 'other-prefix-acme' }), obs)
+    await reconcileEnvelope(ctx, inputOf(ctx, { targetNamespace: 'other-prefix-acme' }), obs)
     expect(obs.degraded?.reason).toBe('NamespaceOutsidePrefix')
+    expect(writes).toEqual([])
+  })
+
+  // Object names are DNS subdomains, so a legal CR name can still derive an illegal namespace.
+  it('refuses a CR name whose derived namespace is not a DNS label, without writing anything', async () => {
+    const { writes, route } = recorder()
+    const ctx = await contextFor(route)
+    const obs = newObservations()
+    await reconcileEnvelope(ctx, inputOf(ctx, {}, 'acme.example'), obs)
+    expect(obs.degraded?.reason).toBe('InvalidNamespaceName')
+    expect(writes).toEqual([])
+  })
+
+  it('refuses a CR name whose derived namespace exceeds the DNS label length', async () => {
+    const { writes, route } = recorder()
+    const ctx = await contextFor(route)
+    const obs = newObservations()
+    await reconcileEnvelope(ctx, inputOf(ctx, {}, 'a'.repeat(64)), obs)
+    expect(obs.degraded?.reason).toBe('InvalidNamespaceName')
+    expect(obs.degraded?.message).toContain('63')
     expect(writes).toEqual([])
   })
 
@@ -179,7 +217,7 @@ describe('reconcileEnvelope', () => {
     const ctx = await contextFor(route)
     gets.set(namespacePath(NS), { metadata: { name: NS, labels: { [NAMESPACE_CLAIM_LABEL]: 'someone-else' } } })
     const obs = newObservations()
-    await reconcileEnvelope(ctx, inputOf(), obs)
+    await reconcileEnvelope(ctx, inputOf(ctx), obs)
     expect(obs.degraded?.reason).toBe('NamespaceClaimConflict')
     expect(writes).toEqual([])
   })
@@ -188,7 +226,7 @@ describe('reconcileEnvelope', () => {
     const { gets, writes, route } = recorder()
     const ctx = await contextFor(route)
     gets.set(masterPath(ctx.controlNamespace), MASTER_TEMPLATE)
-    await reconcileEnvelope(ctx, inputOf({ suspend: true }), newObservations())
+    await reconcileEnvelope(ctx, inputOf(ctx, { suspend: true }), newObservations())
     const deployment = byPath(writes, '/deployments/ac-daemon')?.body as { spec: { replicas: number } }
     expect(deployment.spec.replicas).toBe(0)
     const pool = byPath(writes, '/sandboxwarmpools/ac-runtime-std')?.body as { spec: { replicas: number } }
@@ -201,7 +239,7 @@ describe('reconcileEnvelope', () => {
     gets.set(masterPath(ctx.controlNamespace), MASTER_TEMPLATE)
     await reconcileEnvelope(
       ctx,
-      inputOf({ quota: { maxAgents: 5, cpu: '8', memory: '16Gi', storage: '0' } }),
+      inputOf(ctx, { quota: { maxAgents: 5, cpu: '8', memory: '16Gi', storage: '0' } }),
       newObservations()
     )
     const quota = byPath(writes, '/resourcequotas/ac-quota')?.body as { spec: { hard: Record<string, string> } }
@@ -217,7 +255,7 @@ describe('reconcileEnvelope', () => {
     const { writes, route } = recorder()
     const ctx = await contextFor(route)
     const obs = newObservations()
-    await reconcileEnvelope(ctx, inputOf(), obs)
+    await reconcileEnvelope(ctx, inputOf(ctx), obs)
     expect(obs.warnings.some((warning) => warning.includes('ac-runtime-std'))).toBe(true)
     expect(byPath(writes, '/sandboxtemplates/ac-runtime-std')).toBeUndefined()
     expect(byPath(writes, '/deployments/ac-daemon')).toBeDefined()
@@ -237,7 +275,7 @@ describe('reconcileEnvelope', () => {
     }
     gets.set(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxwarmpools'), leftovers)
     gets.set(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxtemplates'), leftovers)
-    await reconcileEnvelope(ctx, inputOf(), newObservations())
+    await reconcileEnvelope(ctx, inputOf(ctx), newObservations())
     const deletes = writes.filter((write) => write.method === 'DELETE').map((write) => write.path)
     expect(deletes).toContain(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxwarmpools', 'ac-runtime-old'))
     expect(deletes).toContain(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxtemplates', 'ac-runtime-old'))
@@ -252,7 +290,7 @@ describe('reconcileEnvelope', () => {
     gets.set(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxwarmpools'), existing)
     gets.set(groupPath(SANDBOX_EXTENSIONS_GROUP, NS, 'sandboxtemplates'), existing)
     const obs = newObservations()
-    await reconcileEnvelope(ctx, inputOf(), obs)
+    await reconcileEnvelope(ctx, inputOf(ctx), obs)
     expect(obs.warnings.some((warning) => warning.includes('ac-runtime-std'))).toBe(true)
     expect(writes.filter((write) => write.method === 'DELETE' && write.path.includes('ac-runtime-std'))).toEqual([])
   })
@@ -261,7 +299,7 @@ describe('reconcileEnvelope', () => {
     const { gets, writes, route } = recorder()
     const ctx = await contextFor(route)
     gets.set(masterPath(ctx.controlNamespace), MASTER_TEMPLATE)
-    await reconcileEnvelope(ctx, inputOf({ egressPolicy: 'locked' }), newObservations())
+    await reconcileEnvelope(ctx, inputOf(ctx, { egressPolicy: 'locked' }), newObservations())
     const template = byPath(writes, `/namespaces/${NS}/sandboxtemplates/ac-runtime-std`)?.body as {
       spec: { networkPolicy: { egress: unknown[] } }
     }
